@@ -2,98 +2,108 @@ import AppKit
 import Carbon
 import Foundation
 
+var lastSwitchTime = Date.distantPast
+let switchCooldownSeconds: TimeInterval = 2
+
+// 获取所有输入法ID
 func getInputMethodList() -> [String] {
   let list = TISCreateInputSourceList(nil, false).takeRetainedValue() as! [TISInputSource]
   var inputMethodList = [String]()
   for source in list {
-    if let name = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
-      let sourceName = Unmanaged<CFString>.fromOpaque(name).takeUnretainedValue() as String
+    if let namePtr = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
+      let sourceName = Unmanaged<CFString>.fromOpaque(namePtr).takeUnretainedValue() as String
       inputMethodList.append(sourceName)
     }
   }
   return inputMethodList
 }
 
+// 获取当前激活的输入法ID
 func getSelectedInputMethod() -> String {
   let currentSource = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
-  let name = TISGetInputSourceProperty(currentSource, kTISPropertyInputSourceID)
-  let sourceName = Unmanaged<CFString>.fromOpaque(name!).takeUnretainedValue() as String
-  return sourceName
+  if let namePtr = TISGetInputSourceProperty(currentSource, kTISPropertyInputSourceID) {
+    let sourceName = Unmanaged<CFString>.fromOpaque(namePtr).takeUnretainedValue() as String
+    return sourceName
+  }
+  return ""
 }
 
+// 缓存输入法列表，避免每次切换都重建
+var cachedInputSources: [TISInputSource]?
+
+// 切换输入法
 func switchInputMethod(to inputMethod: String) {
-  let inputSources = TISCreateInputSourceList(nil, false).takeRetainedValue() as! [TISInputSource]
-  for inputSource in inputSources {
-    if let inputSourceID = TISGetInputSourceProperty(inputSource, kTISPropertyInputSourceID) {
-      let inputSourceIDString =
-        Unmanaged<CFString>.fromOpaque(inputSourceID).takeUnretainedValue() as String
-      if inputSourceIDString.range(of: inputMethod, options: .caseInsensitive) != nil {
-        print("Switching to \(inputSourceIDString)")
+  // 已经是目标输入法则跳过（用子串匹配，和下方选择逻辑保持一致）
+  let currentID = getSelectedInputMethod()
+  if currentID.range(of: inputMethod, options: .caseInsensitive) != nil {
+    return
+  }
+
+  // 冷却时间限制
+  let now = Date()
+  if now.timeIntervalSince(lastSwitchTime) < switchCooldownSeconds {
+    return
+  }
+
+  if cachedInputSources == nil {
+    cachedInputSources = TISCreateInputSourceList(nil, false).takeRetainedValue() as? [TISInputSource]
+  }
+  for inputSource in cachedInputSources ?? [] {
+    if let inputSourceIDPtr = TISGetInputSourceProperty(inputSource, kTISPropertyInputSourceID) {
+      let inputSourceID = Unmanaged<CFString>.fromOpaque(inputSourceIDPtr).takeUnretainedValue() as String
+      if inputSourceID.range(of: inputMethod, options: .caseInsensitive) != nil {
+        print("Switching to \(inputSourceID)")
         TISSelectInputSource(inputSource)
+        lastSwitchTime = now
         return
       }
     }
   }
+
   print("Not found \(inputMethod), maybe not installed?")
-
 }
 
-// Check if config.json file exists
+// 读取配置文件
 let fileManager = FileManager.default
-let configFilePath =
-  "\(ProcessInfo.processInfo.environment["HOME"]!)/.quiet_input_method/.quiet.json"
-var configData: Data?
-if fileManager.fileExists(atPath: configFilePath) {
-  configData = fileManager.contents(atPath: configFilePath)
-}
+let configFilePath = "\(NSHomeDirectory())/.quiet_input_method/.quiet.json"
 
-// Default config
 var DEFAULT_CONFIG = """
-  {
-    "default": "abc",
-    "appConfig": {
-      "Shuangpin": [
-        "Telegram",
-        "WeChat"
-      ],
-      "abc": [
-        "Code"
-      ]
-    }
+{
+  "default": "abc",
+  "appConfig": {
+    "Shuangpin": ["Telegram", "WeChat"],
+    "abc": ["Code"]
   }
-  """
+}
+"""
 
-// Convert json to dict
 func jsonToDict(jsonData: Data) -> [String: Any] {
-  let dict =
-    try? JSONSerialization.jsonObject(with: jsonData, options: .mutableContainers) as! [String: Any]
-  return dict ?? [:]
+  return (try? JSONSerialization.jsonObject(with: jsonData, options: .mutableContainers)) as? [String: Any] ?? [:]
 }
 
-// Load config from file or use default config
-var config = jsonToDict(jsonData: configData ?? DEFAULT_CONFIG.data(using: .utf8)!)
+var configData: Data? = fileManager.contents(atPath: configFilePath)
+let config = jsonToDict(jsonData: configData ?? DEFAULT_CONFIG.data(using: .utf8)!)
 
+// 通过 App 名获取输入法配置
 func getInputMethodByConfig(appName: String) -> String {
-  for (key, value) in config["appConfig"] as! [String: [String]] {
-
-    let appList = value
-    if appList.contains(appName) {
-      return key
+  if let appConfig = config["appConfig"] as? [String: [String]] {
+    for (inputMethod, appList) in appConfig {
+      if appList.contains(appName) {
+        return inputMethod
+      }
     }
   }
-  // if default config exists, use it
-  if let defaultInputMethod = config["default"] as? String {
-    return defaultInputMethod
-  }
-  return "Unknown"
+  return config["default"] as? String ?? "Unknown"
 }
 
-// Listen for app switch events and print the current app
+// 监听 App 切换
 let workspace = NSWorkspace.shared
 var currentApp: NSRunningApplication?
 
 workspace.notificationCenter.addObserver(
-  forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil
+  forName: NSWorkspace.didActivateApplicationNotification,
+  object: nil,
+  queue: nil
 ) { notification in
   if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
     if app != currentApp {
@@ -103,7 +113,7 @@ workspace.notificationCenter.addObserver(
       if inputMethod == "Unknown" {
         return
       }
-      print("Current app: \(app.localizedName ?? "Unknown") to \(inputMethod)")
+      print("Current app: \(appName) -> input method: \(inputMethod)")
       switchInputMethod(to: inputMethod)
     }
   }
@@ -111,9 +121,11 @@ workspace.notificationCenter.addObserver(
 
 print("Listening for app switch events...")
 
-// list all input methods
+// 输出所有输入法
+print("Available input methods:")
 for inputMethod in getInputMethodList() {
-  print(inputMethod)
+  print("- \(inputMethod)")
 }
 
+// 保持主线程运行
 RunLoop.main.run()
